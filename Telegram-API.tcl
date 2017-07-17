@@ -28,8 +28,9 @@ proc initialize {} {
 		return -1
 	}
 
-	if {[jsonGetValue $result "" "ok"] eq "false"} {
-		die "Telegram-API: bad result from getMe method: [jsonGetValue $result "" "description"]"
+	if {[jq::jq ".ok" $result ] != "true"} {
+		putlog "Telegram-API: bad result from getMe method: [jsonGetValue $result "" "description"]"
+		return 1
 	}
 
 	set tg_botname [jsonGetValue $result "result" "username"]
@@ -37,6 +38,42 @@ proc initialize {} {
 }
 
 
+# ---------------------------------------------------------------------------- #
+# Procedure to compute an int value from the arg string                        #
+# Convert all ascii char (from arg) to hex value                               #
+# then sum into one int.                                                       #
+# ---------------------------------------------------------------------------- #
+# Arg: String shouldnot contain space                                          #
+# Return: int base 10                                                          #
+# ---------------------------------------------------------------------------- #
+proc computenickcolor { nick } { 
+        set num [binary encode hex $nick]
+        set base 16
+
+        set total 0
+        foreach d [split $num ""] {
+            if {[string is alpha $d]} {
+                set d [expr {[scan [string tolower $d] %c] - 87}]
+            } elseif {![string is digit $d]} {
+                putlog "bad digit: $d"
+                return -1
+            }   
+            if {$d >= $base} {
+                putlog "bad digit: $d"
+                return -1
+            }   
+            incr total $d
+        }   
+
+		# Sum the result to produce the smallest number
+        # Unsafe but it can unlikely overflow. To get more than 99 the
+		# first computed number need to be more than 99 999 999 999
+        foreach d [split $total ""] {
+                incr result $d
+        }   
+
+        return $result
+}
 
 # ---------------------------------------------------------------------------- #
 # Procedures for sending data to the Telegram servers                          #
@@ -293,35 +330,58 @@ proc tg2irc_pollTelegram {} {
 	global tg_bot_id tg_bot_token tg_update_id tg_poll_freq tg_channels utftable irc_botname
 	global MSG_TG_MSGSENT MSG_TG_AUDIOSENT MSG_TG_PHOTOSENT MSG_TG_DOCSENT MSG_TG_STICKERSENT MSG_TG_VIDEOSENT MSG_TG_VOICESENT MSG_TG_CONTACTSENT MSG_TG_LOCATIONSENT MSG_TC_VENUESENT MSG_TG_USERADD MSG_TG_USERLEFT MSG_TG_CHATTITLE MSG_TG_PICCHANGE MSG_TG_PICDELETE MSG_TG_UNIMPL
 
-	if { [ catch {
-		set result [exec curl --tlsv1.2 -s -X POST https://api.telegram.org/bot$tg_bot_id:$tg_bot_token/getUpdates?offset=$tg_update_id]
+	if { [botonchan] != 1 } {
+		putlog "Not connected to IRC, skipping"
+		# Dont go into the function but plan the next one
+		utimer $tg_poll_freq tg2irc_pollTelegram
+		return 1
+	}
+
+	#putlog "updateid: $tg_update_id"
+
+	# Catch if curl fail
+	if { [catch { 
+		set result [exec curl --tlsv1.2 -s -X POST https://api.telegram.org/bot$tg_bot_id:$tg_bot_token/getUpdates?offset=$tg_update_id] 
 	} ] } {
 		putlog "Telegram-API: cannot connect to api.telegram.com using getUpdates method: $result"
+		# Dont go into the parsing process but plan the next polling
+		utimer $tg_poll_freq tg2irc_pollTelegram^M
 		return -1
 	}
 
-	if {[jsonGetValue $result "" "ok"] eq "false"} {
-		putlog "Telegram-API: bad result from getUpdates method: [jsonGetValue $result "" "description"]"
+	# Catch if result isnot formated as it should (curl worked but get another page)
+	if { [catch { set isok [jq::jq ".ok" $result] } ] } {
+		putlog "Telegram-API: Error while reading TG result. No internet connection? "
+		# Dont go into the parsing process but plan the next polling
+		utimer $tg_poll_freq tg2irc_pollTelegram
+		return -1
 	}
 
-	set recordstart [string first "\{\"update_id\":" $result]
-	
-	while {$recordstart != -1} {
-		set recordend [string first "\{\"update_id\":" $result $recordstart+13]
-		if {$recordend == -1} {
-			set record [string range $result $recordstart end]
-		} else {
-			set record [string range $result $recordstart $recordend]
-		}
+	# Catch if result is not in a format we can parse
+	if { $isok != "true"} {
+		putlog "Telegram-API: bad result from getUpdates method: [jsonGetValue $result "" "description"]"
+		return -1
+		# Dont go into the parsing process but plan the next polling
+		utimer $tg_poll_freq tg2irc_pollTelegram
+		return -1
+	}
+	#putlog "result true, clear update_id"
+	set tg_update_id 0
 
-		switch [jsonGetValue $record "chat" "type"] {
+	foreach u_id [jq::jq ".result\[\].update_id" $result] {
+		#puts "------uid: $u_id"
+		set msg [ jq::jq ".result\[\] \| select(.update_id == $u_id)" $result]
+		#putlog "update: $tg_update_id"
+		#putlog "loop: $msg"
+
+		switch [jq::jq ".message.chat.type" $msg] {
 			# Check if this record is a private chat record...
 			"private" {
-				if {[jsonHasKey $record "text"]} {
+				if { [jq::jq ".message.text" $msg] != "null" } {
 					# Bug: the object should really be "message" and not ""
-					set txt [remove_slashes [utf2ascii [jsonGetValue $record "" "text"]]]
-					set msgid [jsonGetValue $record "message" "message_id"]
-					set fromid [jsonGetValue $record "from" "id"]
+					set txt [remove_slashes [utf2ascii [jq::jq ".message.text" $msg]]]
+					set msgid [jq::jq ".message.message_id" $msg]
+					set fromid [jq::jq ".message.from.id" $msg]
 
 					tg2irc_privateCommands "$fromid" "$msgid" "$txt"
 				}
@@ -329,31 +389,45 @@ proc tg2irc_pollTelegram {} {
 
 			# Check if this record is a group chat record...
 			"group" {
-				set chatid [jsonGetValue $record "chat" "id"]
-				set name [concat [jsonGetValue $record "from" "first_name"] [jsonGetValue $record "from" "last_name"]]
+				set chatid [jq::jq ".message.chat.id" $msg]
+				set name [jq::jq ".message.from.username" $msg]
+
+				# If username is not find use first_name instead
+				if { $name == "null" } {
+					set name [jq::jq ".message.from.first_name" $msg]
+				}
+
+				# Colorize nick and store it
+				catch [set color [computenickcolor $name]]
+				set name "\003$color$name\003"
 				
 				#
-				if {[jsonHasKey $record "text"]} {
-					# Bug: the object should really be "message" and not ""
-					set txt [remove_slashes [utf2ascii [jsonGetValue $record "" "text"]]]
+				if { [jq::jq ".message.text" $msg] != "null" } {
+					set txt [remove_slashes [utf2ascii [jq::jq ".message.text" $msg ]]]
+					if { [jq::jq ".message.reply_to_message" $msg] != "null" } {
+						set replyname [jq::jq ".message.reply_to_message.from.username" $msg]
+						catch [set color [computenickcolor $replyname]]
+						set txt "reply to \003$color$replyname\003: $txt"
+					}
 
 					foreach {tg_chat_id irc_channel} [array get tg_channels] {
 						if {$chatid eq $tg_chat_id} {
 							putchan $irc_channel [format $MSG_TG_MSGSENT "[utf2ascii $name]" "$txt"]
 							if {[string index $txt 0] eq "/"} {
-								set msgid [jsonGetValue $record "message" "message_id"]
+								set msgid [jq::jq ".message.message_id" $msg]
 								tg2irc_botCommands "$tg_chat_id" "$msgid" "$irc_channel" "$txt"
 							}
 						}
 					}
 				}
 
+
 				# Check if audio has been sent to the Telegram group
-				if {[jsonHasKey $record "audio"]} {
-					set tg_file_id [jsonGetValue $record "audio" "file_id"]
-					set tg_performer [jsonGetValue $record "audio" "performer"]
-					set tg_title [jsonGetValue $record "audio" "title"]
-					set tg_duration [jsonGetValue $record "audio" "duration"]
+				if { [jq::jq ".message.audio" $msg ] != "null" } {
+					set tg_file_id [jq::jq ".message.audio.file_id" $msg]
+					set tg_performer [jq::jq ".message.audio.performer" $msg]
+					set tg_title [jq::jq ".message.audio.title" $msg]
+					set tg_duration [jq::jq ".message.audio.duration" $msg]
 					if {$tg_duration eq ""} {
 						set tg_duration "0"
 					}
@@ -366,10 +440,10 @@ proc tg2irc_pollTelegram {} {
 				}
 
 				# Check if a document has been sent to the Telegram group
-				if {[jsonHasKey $record "document"]} {
-					set tg_file_id [jsonGetValue $record "document" "file_id"]
-					set tg_file_name [jsonGetValue $record "document" "file_name"]
-					set tg_file_size [jsonGetValue $record "document" "file_size"]
+				if { [jq::jq ".message.document" $msg] != "null" } {
+					set tg_file_id [jq::jq  ".message.document.file_id" $msg]
+					set tg_file_name [jq::jq ".message.document.file_name" $msg]
+					set tg_file_size [jq::jq ".message.document.file_size" $msg]
 
 					foreach {tg_chat_id irc_channel} [array get tg_channels] {
 						if {$chatid eq $tg_chat_id} {
@@ -379,11 +453,10 @@ proc tg2irc_pollTelegram {} {
 				}
 
 				# Check if a photo has been sent to the Telegram group
-				if {[jsonHasKey $record "photo"]} {
-					set tg_file_id [jsonGetValue $record "" "file_id"]
-					if {[jsonHasKey $record "caption"]} {
-						# Bug: the object should really be "photo" and not ""
-						set caption " ([utf2ascii [remove_slashes [jsonGetValue $record "" "caption"]]])"
+				if { [jq::jq ".message.photo" $msg] != "null" } {
+					set tg_file_id [jq::jq ".message.photo\[0\].file_id" $msg]
+					if {[jq::jq ".message.photo\[0\].caption" $msg] != "null" } {
+						set caption " ([utf2ascii [remove_slashes [jq::jq ".message.photo\[0\].caption" $msg]]])"
 					} else {
 						set caption ""
 					}
@@ -396,8 +469,8 @@ proc tg2irc_pollTelegram {} {
 				}
 
 				# Check if a sticker has been sent to the Telegram group
-				if {[jsonHasKey $record "sticker"]} {
-					set emoji [jsonGetValue $record "sticker" "emoji"]
+				if {[jq::jq ".message.sticker" $msg] != "null" } {
+					set emoji [jq::jq ".message.thumb.file_id" $msg]
 
 					foreach {tg_chat_id irc_channel} [array get tg_channels] {
 						if {$chatid eq $tg_chat_id} {
@@ -407,16 +480,14 @@ proc tg2irc_pollTelegram {} {
 				}
 
 				# Check if a video has been sent to the Telegram group
-				if {[jsonHasKey $record "video"]} {
-					set tg_file_id [jsonGetValue $record "video" "file_id"]
-					set tg_duration [jsonGetValue $record "video" "duration"]
-					if {$tg_duration eq ""} {
+				if {[jq::jq ".message.video" $msg] != "null"} {
+					set tg_file_id [jq::jq ".message.video.file_id" $msg]
+					set tg_duration [jq::jq ".message.video.duration" $msg]
+					if {$tg_duration eq "null"} {
 						set tg_duration "0"
 					}
-
-					if {[jsonHasKey $record "caption"]} {
-						# Bug: the object should really be "video" and not ""
-						set caption " ([utf2ascii [remove_slashes [jsonGetValue $record "" "caption"]]])"
+					if {[jq::jq ".message.video.caption" $msg] != "null" } {
+						set caption " ([utf2ascii [remove_slashes [jq:jq ".message.video.caption" $msg]]])"
 					} else {
 						set caption ""
 					}
@@ -429,12 +500,12 @@ proc tg2irc_pollTelegram {} {
 				}
 
 				# Check if a voice object has been sent to the Telegram group
-				if {[jsonHasKey $record "voice"]} {
-					set tg_file_id [jsonGetValue $record "voice" "file_id"]
-					set tg_duration [jsonGetValue $record "voice" "duration"]
-					set tg_file_size [jsonGetValue $record "document" "file_size"]
-					if {$tg_duration eq ""} {
-						set tg_duration "0"
+				if {[jq::jq ".message.voice" $msg] != "null"} {
+					set tg_file_id [jq::jq ".message.voice.file_id" $msg]
+					set tg_duration [jq::jq ".message.voice.duration" $msg]
+					set tg_file_size [jq::jq ".message.voice.file_size" $msg]
+					if { $tg_duration eq "null" } {
+						set tg_duration 0
 					}
 
 					foreach {tg_chat_id irc_channel} [array get tg_channels] {
@@ -444,6 +515,7 @@ proc tg2irc_pollTelegram {} {
 					}
 				}
 
+if {0} {
 				# Check if a contact has been sent to the Telegram group
 				if {[jsonHasKey $record "contact"]} {
 					set tg_phone_number [jsonGetValue $record "contact" "phone_number"]
@@ -538,6 +610,7 @@ proc tg2irc_pollTelegram {} {
 					}
 				}
 			}
+}
 
 			# Check if this record is a supergroup record
 			"supergroup" {
@@ -556,17 +629,13 @@ proc tg2irc_pollTelegram {} {
 					}
 				}
 			}
+
 		}
+	# If we are here everything goes fine
+	# increment tg offset
+	set tg_update_id $u_id
+	incr tg_update_id
 
-		set recordstart $recordend
-	}
-
-	# Set the update_id for the next poll
-	set recordend [string last "\{\"update_id\":" $result]
-	if {$recordend != -1} {
-		set idend [string first "," $result $recordend+13]
-		set tg_update_id [string range $result $recordend+13 $idend-1]
-		incr tg_update_id
 	}
 
 	# ...and set a timer so it triggers the next poll
@@ -813,16 +882,7 @@ proc jsonGetValue {record object key} {
 				return [string range $record [expr $keystart+$length+4] $end-1]
 			} else {
 				set end [string first "," $record [expr $keystart+$length+3]]
-				if {$end != -1} {
-					return [string range $record [expr $keystart+$length+3] $end-1]
-				} else {
-					set end [string first "\}" $record [expr $keystart+$length+3]]
-					if {$end != -1} {
-						return [string trim [string range $record [expr $keystart+$length+3] $end-1]]
-					} else {
-						return "UNKNOWN"
-					}
-				}
+				return [string range $record [expr $keystart+$length+3] $end-1]
 			}
 		}
 	}
@@ -830,6 +890,38 @@ proc jsonGetValue {record object key} {
 }
 
 
+# http://wiki.tcl.tk/11630
+
+# jq-0.4.0.tm
+# To use this module you need jq version 1.5rc1 or later installed.
+namespace eval jq {
+    proc jq {filter data {options {-r}}} {
+        exec jq {*}$options $filter << $data
+    }
+    proc json2dict {data} {
+        jq {
+            def totcl:
+                if type == "array" then
+                    # Convert array to object with keys 0, 1, 2... and process
+                    # it as object.
+                    [range(0;length) as $i
+                        | {key: $i | tostring, value: .[$i]}]
+                    | from_entries
+                    | totcl
+                elif type == "object" then
+                    .
+                    | to_entries
+                    | map("{\(.key)} {\(.value | totcl)}")
+                    | join(" ")
+                else
+                    tostring
+                    | gsub("{"; "\\{")
+                    | gsub("}"; "\\}")
+                end;
+            . | totcl
+        } $data
+    }
+}
 
 # ---------------------------------------------------------------------------- #
 # Start of main code                                                           #
@@ -843,7 +935,6 @@ source "[file dirname [info script]]/utftable.tcl"
 
 source "[file dirname [info script]]/ImageSearch.tcl"
 source "[file dirname [info script]]/PSN.tcl"
-source "[file dirname [info script]]/Quotes.tcl"
 source "[file dirname [info script]]/Soundcloud.tcl"
 source "[file dirname [info script]]/Spotify.tcl"
 
