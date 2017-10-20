@@ -28,6 +28,7 @@ proc imagesearch_getImage {chat_id msgid channel message parameter_start} {
 		set imgresult [exec curl --tlsv1.2 -s -X GET https://api.duckduckgo.com/?kah=nl-nl&kl=$s_region&kad=$s_language&kp=$s_safesearch&q=$imagequery]
 	} ] } {
 		putlog "Telegram-API: cannot connect to api.duckduckgo.com using imagesearch_getImage method: $imgresult"
+		return -1
 	}
 
 	# Bug: the object should really be "message" and not ""
